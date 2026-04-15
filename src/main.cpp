@@ -123,7 +123,7 @@ void initCamera() {
   }
 }
 
-// ========== HTML-страница с формой загрузки ==========
+// ========== HTML-страница загрузки ==========
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -140,6 +140,12 @@ const char index_html[] PROGMEM = R"rawliteral(
     </form>
     <hr>
     <p>Выберите файл прошивки (.bin) и нажмите "Обновить".</p>
+    <form method="POST" action="handleStream">
+        <input type="submit" value="Видео">
+    </form>
+    <form method="POST" action="/rollback">
+        <input type="submit" value="Откат прошивки">
+    </form>
 </body>
 </html>
 )rawliteral";
@@ -275,6 +281,17 @@ WiFi.mode(WIFI_STA);
     else {
       Serial.println("Static IP configured!");
     }
+    }
+  }
+  else {
+    // Создание Wi-Fi Wi-Fi
+    WiFi.softAP("ESP", "1122334455");
+    if(!WiFi.softAPConfig(staticIP, staticIP, subnet)) {
+      Serial.println("Failed to configure Static IP");
+    } 
+    else {
+      Serial.println("Static IP configured!");
+    }
     Serial.println("\nWiFi created with name: " + *ssid);
   }
 
@@ -286,7 +303,6 @@ WiFi.mode(WIFI_STA);
 
   // Запуск веб-сервера
   setupServer();
-
   server.on("/rollback", HTTP_GET, handleRollback);
   server.begin();
   //  server.on("/video", HTTP_GET, handleStream);
