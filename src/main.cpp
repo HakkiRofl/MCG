@@ -5,7 +5,7 @@
 #include "esp_camera.h"          // для камеры (понадобится позже)
 #include <esp_ota_ops.h>
 // ========== Настройки Wi-Fi ==========
-const char* ssid = "RSP";
+const char* ssid = "Pixel";
 const char* password = "1122334455";
 IPAddress staticIP(192, 168, 0, 128);
 IPAddress gateway(192, 168, 1, 1);    // IP Address of your network gateway (router)
@@ -70,7 +70,7 @@ void initCamera() {
   Serial.println("Camera OK");
 }
 
-// ========== HTML-страница с формой загрузки ==========
+// ========== HTML-страница загрузки ==========
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -80,13 +80,19 @@ const char index_html[] PROGMEM = R"rawliteral(
     <meta name="viewport" content="width=device-width, initial-scale=1">
 </head>
 <body>
-    <h1>ESP32-CAM OTA Update V2</h1>
+    <h1>ESP32-CAM OTA Update V2.2</h1>
     <form method="POST" action="/update" enctype="multipart/form-data">
         <input type="file" name="firmware" accept=".bin">
         <input type="submit" value="Обновить">
     </form>
     <hr>
     <p>Выберите файл прошивки (.bin) и нажмите "Обновить".</p>
+    <form method="POST" action="handleStream">
+        <input type="submit" value="Видео">
+    </form>
+    <form method="POST" action="/rollback">
+        <input type="submit" value="Откат прошивки">
+    </form>
 </body>
 </html>
 )rawliteral";
@@ -183,49 +189,56 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Booting...");
 
-  // Подключение к Wi-Fi
-  WiFi.softAP(ssid, password);
-  if(!WiFi.softAPConfig(staticIP, staticIP, subnet)) {
-    Serial.println("Failed to configure Static IP");
-  } else {
-    Serial.println("Static IP configured!");
+  WiFi.mode(WIFI_STA);
+  int8_t countWiFi = WiFi.scanNetworks();
+  bool findWiFi = false;
+  for (int8_t i = 0; i < countWiFi; i++) {
+    if (WiFi.SSID(i) == ssid)
+      findWiFi = true;
   }
-  
-  // WiFi.mode(WIFI_AP);
-  // WiFi.begin(ssid, password);
-  // if(!WiFi.config(staticIP, gateway, subnet, primaryDNS, secondaryDNS)) {
-  //   Serial.println("Failed to configure Static IP");
-  // } else {
-  //   Serial.println("Static IP configured!");
-  // }
 
-  // while (WiFi.status() != WL_CONNECTED) {
-  //   delay(500);
-  //   Serial.print(".");
-  // }
-  if (WiFi.getMode() == WIFI_MODE_STA)
+  if (findWiFi) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    // if(!WiFi.config(staticIP, gateway, subnet, primaryDNS, secondaryDNS)) {
+    //   Serial.println("Failed to configure Static IP");
+    // } else {
+    //   Serial.println("Static IP configured!");
+    // }
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
     Serial.println("\nWiFi connected");
-  else
+    }
+  }
+  else {
+    // Создание Wi-Fi Wi-Fi
+    WiFi.softAP("ESP", "1122334455");
+    if(!WiFi.softAPConfig(staticIP, staticIP, subnet)) {
+      Serial.println("Failed to configure Static IP");
+    } 
+    else {
+      Serial.println("Static IP configured!");
+    }
     Serial.println("\nWiFi created with name: " + *ssid);
+  }
 
-  // Serial.print("IP address: ");
-  // Serial.println(WiFi.localIP());
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+
 
   // Инициализация камеры
   initCamera();
 
   // Запуск веб-сервера
   setupServer();
-
   server.on("/rollback", HTTP_GET, handleRollback);
-  server.begin();
-   server.on("/video", HTTP_GET, handleStream);
-  server.begin();
+  server.on("/video", HTTP_GET, handleStream);
 
 }
 
 void loop() {
   server.handleClient();  // обрабатываем входящие запросы
 
-  // Здесь позже можно добавить обработку видеопотока
 }
