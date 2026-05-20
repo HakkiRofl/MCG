@@ -6,61 +6,29 @@
 #include <esp_ota_ops.h>
 #include <WiFiUdp.h>
 #include <esp_wifi.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <iostream>
+// ===========================================
+// КОНФИГУРАЦИЯ WiFi
+// ===========================================
+const char* ssid = "RT-GPON-6A98";        // Замените на ваш SSID
+const char* password = "f64UGz7afr"; // Замените на ваш пароль
 
-
-// Настройки UDP (ПК)
-const char* udpAddress = "192.168.0.10"; // Например, 192.168.1.100
+// ===========================================
+// КОНФИГУРАЦИЯ UDP
+// ===========================================
+const char* udpAddress = "192.168.0.10";  // IP адрес вашего ПК
 const int udpPort = 12345;
+const int CHUNK_SIZE = 1400;  // Размер фрагмента (оптимально для UDP)
 
 WiFiUDP udp;
-// ------------------------------------------------------------
-// 2. Протокол передачи (Заголовок фрагмента)
-// ------------------------------------------------------------
-// Мы будем отправлять каждый кадр фрагментами. Чтобы получатель
-// мог правильно собрать кадр, каждый фрагмент будет предваряться
-// небольшим заголовком с метаинформацией.
-// ------------------------------------------------------------
-// Отправка целого числа в сетевом порядке байт (Big Endian)
-// ------------------------------------------------------------
-void writeUint16(uint8_t* buf, uint16_t val) {
-  buf[0] = (val >> 8) & 0xFF;
-  buf[1] = val & 0xFF;
-}
-
-void writeUint32(uint8_t* buf, uint32_t val) {
-  buf[0] = (val >> 24) & 0xFF;
-  buf[1] = (val >> 16) & 0xFF;
-  buf[2] = (val >> 8) & 0xFF;
-  buf[3] = val & 0xFF;
-}
-
-const int CHUNK_SIZE = 1400; // Макс. размер данных в UDP-пакете (меньше MTU)
-// !!! ВАЖНО: Выбор разрешения. От этого зависит скорость и качество !!!
-// FRAMESIZE_QVGA (320x240)  -> Очень быстро, до 30+ FPS.
-// FRAMESIZE_HVGA (480x320)  -> Хороший баланс качества и скорости (~20 FPS).
-// FRAMESIZE_VGA (640x480)   -> Медленнее (8-12 FPS), но детальнее.
-static const framesize_t FRAME_SIZE = FRAMESIZE_HVGA;
-
-// !!! ВАЖНО: Качество JPEG (0 - лучшее, 63 - худшее) !!!
-// Меньшее число = лучше качество, но больше размер файла.
-// Значения 10-20 - хороший компромисс. Для скорости ставьте выше.
-static const int JPEG_QUALITY = 12;
-
-
-// ========== Настройки Wi-Fi ==========
-const char* ssid = "RT-GPON-6A98";
-const char* password = "f64UGz7afr";
-IPAddress staticIP(192, 168, 0, 128);
-IPAddress gateway(192, 168, 1, 1);    // IP Address of your network gateway (router)
-IPAddress subnet(255, 255, 255, 0);   // Subnet mask
-IPAddress primaryDNS(192, 168, 1, 1); // Primary DNS (optional)
-IPAddress secondaryDNS(0, 0, 0, 0);   // Secondary DNS (optional)
-
 // ========== Настройки веб-сервера ==========
 WebServer server(80);
-
-// ========== Пин-конфигурация для ESP32-CAM ==========
-// (стандартная для AI-Thinker)
+// ===========================================
+// КОНФИГУРАЦИЯ КАМЕРЫ AI-THINKER
+// ===========================================
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
@@ -78,7 +46,17 @@ WebServer server(80);
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-// ========== Инициализация камеры ==========
+// ===========================================
+// ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+// ===========================================
+uint16_t imageCounter = 0;
+unsigned long lastFrameTime = 0;
+int fps = 0;
+int frameCount = 0;
+
+// ===========================================
+// ИНИЦИАЛИЗАЦИЯ КАМЕРЫ
+// ===========================================
 void initCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -99,30 +77,115 @@ void initCamera() {
   config.pin_sscb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAME_SIZE;  // можно изменить позже
-  config.pixel_format = PIXFORMAT_JPEG;   // <-- Ключевое изменение: используем JPEG!
-  config.jpeg_quality = JPEG_QUALITY;
-  config.fb_count = 2;                    // Двойная буферизация для скорости
-  config.grab_mode = CAMERA_GRAB_LATEST;  // Берем самый свежий кадр
+  config.xclk_freq_hz = 20000000;  // 20MHz для стабильности
+  config.pixel_format = PIXFORMAT_JPEG;
 
+  // Оптимизированные настройки для баланса качества и скорости
+  config.frame_size = FRAMESIZE_VGA;     // 640x480 - хороший баланс
+  config.jpeg_quality = 12;               // 10-15 оптимально (меньше = лучше качество, но больше размер)
+  config.fb_count = 2;                    // Двойная буферизация для плавности
+  config.grab_mode = CAMERA_GRAB_LATEST;  // Всегда берем последний кадр
+  
+  // Инициализация камеры
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
+    Serial.printf("❌ Camera init failed with error 0x%x\n", err);
     return;
   }
-  Serial.println("Camera initialized.");
 
-  // Небольшая оптимизация датчика для лучшей картинки
- sensor_t * s = esp_camera_sensor_get();
-  if (s) {
-    s->set_pixformat(s, PIXFORMAT_JPEG);
-    s->set_framesize(s, FRAME_SIZE);
-    s->set_quality(s, JPEG_QUALITY);
-    Serial.println("Sensor format forced to JPEG.");
+  // Дополнительные настройки сенсора для улучшения качества
+  sensor_t * s = esp_camera_sensor_get();
+  if (s != NULL) {
+    s->set_brightness(s, 0);     // -2 до 2
+    s->set_contrast(s, 0);       // -2 до 2
+    s->set_saturation(s, 0);     // -2 до 2
+    s->set_special_effect(s, 0); // 0 = нет эффектов
+    s->set_whitebal(s, 1);       // Автобаланс белого
+    s->set_awb_gain(s, 1);       // Автоматическая настройка усиления
+    s->set_wb_mode(s, 0);        // Режим баланса белого (0 = авто)
+    s->set_exposure_ctrl(s, 1);  // Автоэкспозиция
+    s->set_aec2(s, 0);           // AEC DSP
+    s->set_ae_level(s, 0);       // -2 до 2
+    s->set_aec_value(s, 300);    // 0 до 1200
+    s->set_gain_ctrl(s, 1);      // Автоусиление
+    s->set_agc_gain(s, 0);       // 0 до 30
+    s->set_gainceiling(s, (gainceiling_t)0); // 0 до 6
+    s->set_bpc(s, 0);            // Black pixel correction
+    s->set_wpc(s, 1);            // White pixel correction
+    s->set_raw_gma(s, 1);        // Гамма-коррекция
+    s->set_lenc(s, 1);           // Коррекция линз
+    s->set_hmirror(s, 0);        // Горизонтальное отражение
+    s->set_vflip(s, 0);          // Вертикальное отражение
+    s->set_dcw(s, 1);            // Масштабирование
+    s->set_colorbar(s, 0);       // Тестовая палитра (отключено)
   }
+
+  Serial.println("✅ Camera initialized successfully");
+  Serial.printf("   Resolution: VGA (640x480)\n");
+  Serial.printf("   JPEG Quality: %d\n", config.jpeg_quality);
+  Serial.printf("   Frame buffers: %d\n", config.fb_count);
 }
 
+// ===========================================
+// ОТПРАВКА КАДРА ПО UDP
+// ===========================================
+void sendFrameUDP(camera_fb_t * fb) {
+  if (!fb || fb->len == 0) {
+    Serial.println("⚠️ Invalid frame buffer");
+    return;
+  }
+
+  uint16_t totalSize = fb->len;
+  if (totalSize > 100 * 1024) {  // Защита от слишком больших кадров
+    Serial.printf("⚠️ Frame too large: %d bytes, skipping\n", totalSize);
+    return;
+  }
+
+  uint16_t totalFragments = (totalSize + CHUNK_SIZE - 1) / CHUNK_SIZE;
+  uint16_t currentImgId = imageCounter++;
+
+  // Отправка фрагментов
+  for (uint16_t fragId = 0; fragId < totalFragments; fragId++) {
+    size_t offset = fragId * CHUNK_SIZE;
+    size_t buff_offset = totalSize - offset;
+    size_t fragmentSize = min(static_cast<size_t>(CHUNK_SIZE), buff_offset);
+
+    // Создание заголовка (8 байт)
+    uint8_t header[8];
+    header[0] = (currentImgId >> 8) & 0xFF;
+    header[1] = currentImgId & 0xFF;
+    header[2] = (fragId >> 8) & 0xFF;
+    header[3] = fragId & 0xFF;
+    header[4] = (totalFragments >> 8) & 0xFF;
+    header[5] = totalFragments & 0xFF;
+    header[6] = (totalSize >> 8) & 0xFF;
+    header[7] = totalSize & 0xFF;
+
+    // Создание пакета
+    uint8_t packet[8 + CHUNK_SIZE];
+    memcpy(packet, header, 8);
+    memcpy(packet + 8, fb->buf + offset, fragmentSize);
+
+    // Отправка UDP пакета
+    udp.beginPacket(udpAddress, udpPort);
+    udp.write(packet, 8 + fragmentSize);
+    udp.endPacket();
+
+    // Минимальная задержка для предотвращения переполнения буфера
+    delayMicroseconds(100);
+  }
+
+  // Обновление FPS каждую секунду
+  frameCount++;
+  uint8_t currentTime = millis();
+  if (currentTime - lastFrameTime >= 1000) {
+    fps = frameCount;
+    frameCount = 0;
+    lastFrameTime = currentTime;
+    Serial.printf("📊 FPS: %d | Frame size: %d bytes | Fragments: %d\n", 
+                  fps, totalSize, totalFragments);
+  }
+}
 // ========== HTML-страница загрузки ==========
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -149,26 +212,10 @@ const char index_html[] PROGMEM = R"rawliteral(
 </body>
 </html>
 )rawliteral";
-
 // ========== Обработчик корневой страницы ==========
 void handleRoot() {
   server.send(200, "text/html", index_html);
 }
-
-
-//  ========== Откат до прошлой прошивки ==========
-void handleRollback() {
-  const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
-  if (partition == NULL) {
-    server.send(500, "text/plain", "No rollback partition");
-    return;
-  }
-  esp_ota_set_boot_partition(partition);
-  server.send(200, "text/plain", "Rollback set, rebooting...");
-  delay(1000);
-  ESP.restart();
-}
-
 // ========== Обработчик OTA-обновления ==========
 void handleUpdate() {
   // Проверяем, что пришёл файл
@@ -203,27 +250,17 @@ void handleUpdate() {
   }
   delay(0);
 }
-
-
-// void handleStream() {
-//   WiFiClient client = server.client();
-//   client.println("HTTP/1.1 200 OK");
-//   client.println("Content-Type: multipart/x-mixed-replace; boundary=--jpgboundary");
-//   client.println();
-
-//   while (client.connected()) {
-//     camera_fb_t *fb = esp_camera_fb_get();
-//     if (!fb) continue;
-//     client.printf("--jpgboundary\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
-//     client.write(fb->buf, fb->len);
-//     client.println("\r\n");
-//     esp_camera_fb_return(fb);
-//     delay(25);  // регулировка кадров
-//   }
-// }
-
-
-
+void handleRollback() {
+  const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
+  if (partition == NULL) {
+    server.send(500, "text/plain", "No rollback partition");
+    return;
+  }
+  esp_ota_set_boot_partition(partition);
+  server.send(200, "text/plain", "Rollback set, rebooting...");
+  delay(1000);
+  ESP.restart();
+}
 // ========== Настройка маршрутов сервера ==========
 void setupServer() {
   server.on("/", HTTP_GET, handleRoot);
@@ -237,128 +274,64 @@ void setupServer() {
   Serial.println("HTTP server started");
 }
 
-
-
-
-// ========== Главная функция setup ==========
+// ===========================================
+// SETUP
+// ===========================================
 void setup() {
   Serial.begin(115200);
-  Serial.println("Booting...");
+  Serial.println("\n\n🚀 ESP32-CAM Stream Starting...");
 
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  //esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-  // Принудительно N, если роутер поддерживает:
-  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11N);
-
-WiFi.mode(WIFI_STA);
-  int8_t countWiFi = WiFi.scanNetworks();
-  bool findWiFi = false;
-  for (int8_t i = 0; i < countWiFi; i++) {
-    if (WiFi.SSID(i) == ssid)
-      findWiFi = true;
+  // Подключение к WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("📡 Connecting to WiFi");
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
   }
 
-  if (findWiFi) {
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, password);
-    if(!WiFi.config(staticIP, gateway, subnet, primaryDNS, secondaryDNS)) {
-      Serial.println("Failed to configure Static IP");
-    } else {
-      Serial.println("Static IP configured!");
-    }
-    while (WiFi.status() != WL_CONNECTED) {
-      delay(500);
-      Serial.print(".");
-    Serial.println("\nWiFi connected");
-    }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi Connected!");
+    Serial.printf("   IP Address: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("   Target PC: %s:%d\n", udpAddress, udpPort);
+  } else {
+    Serial.println("\n❌ WiFi connection failed!");
+    return;
   }
-  else {
-    // Создание Wi-Fi Wi-Fi
-    WiFi.softAP("ESP", "1122334455");
-    if(!WiFi.softAPConfig(staticIP, staticIP, subnet)) {
-      Serial.println("Failed to configure Static IP");
-    } 
-    else {
-      Serial.println("Static IP configured!");
-    }
-    }
-  }
-  else {
-    // Создание Wi-Fi Wi-Fi
-    WiFi.softAP("ESP", "1122334455");
-    if(!WiFi.softAPConfig(staticIP, staticIP, subnet)) {
-      Serial.println("Failed to configure Static IP");
-    } 
-    else {
-      Serial.println("Static IP configured!");
-    }
-    Serial.println("\nWiFi created with name: " + *ssid);
-  }
-
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
 
   // Инициализация камеры
   initCamera();
 
+  Serial.println("\n🎥 Starting video stream...");
+  lastFrameTime = millis();
   // Запуск веб-сервера
   setupServer();
   server.on("/rollback", HTTP_GET, handleRollback);
   server.begin();
-  //  server.on("/video", HTTP_GET, handleStream);
-  server.begin();
-  
 }
 
-uint16_t currentImageId = 0;
-
-
-
+// ===========================================
+// LOOP
+// ===========================================
 void loop() {
-  server.handleClient();  // обрабатываем входящие запросы
-  // 1. Захват кадра с камеры (уже в JPEG)
+  // Захват кадра
   camera_fb_t * fb = esp_camera_fb_get();
   if (!fb) {
-    Serial.println("Capture failed");
+    Serial.println("❌ Frame buffer acquisition failed");
+    delay(100);
     return;
   }
 
-  // Проверка JPEG-заголовка
-  if (fb->len < 2 || fb->buf[0] != 0xFF || fb->buf[1] != 0xD8) {
-    Serial.printf("ERROR: Not a JPEG frame! size=%u, first bytes: %02X %02X\n", 
-                  fb->len, fb->buf[0], fb->buf[1]);
-    esp_camera_fb_return(fb);
-    return;
-  }
+  // Отправка кадра
+  sendFrameUDP(fb);
 
-  Serial.printf("JPEG frame: id=%u, size=%u bytes\n", currentImageId, fb->len);
-
-  uint16_t totalFragments = (fb->len + CHUNK_SIZE - 1) / CHUNK_SIZE;
-  
-  for (uint16_t i = 0; i < totalFragments; i++) {
-    // Формируем заголовок вручную (8 байт)
-    uint8_t header[8];
-    writeUint16(&header[0], currentImageId);
-    writeUint16(&header[2], i);
-    writeUint16(&header[4], totalFragments);
-    writeUint16(&header[6], fb->len);  // размер помещается в uint16_t? Да, до 65535 байт
-    
-    // Если размер больше 65535 (маловероятно для JPEG), придется использовать 4 байта,
-    // но для простоты пока ограничимся 16 битами (JPEG до 64 КБ).
-    // В нашем случае fb->len обычно < 30000.
-
-    size_t offset = i * CHUNK_SIZE;
-    size_t chunkSize = min((size_t)CHUNK_SIZE, fb->len - offset);
-    
-    udp.beginPacket(udpAddress, udpPort);
-    udp.write(header, sizeof(header));
-    udp.write(fb->buf + offset, chunkSize);
-    if (udp.endPacket() <= 0) {
-      Serial.println("UDP send error");
-    }
-    delay(20);
-  }
-  
+  // Освобождение буфера
   esp_camera_fb_return(fb);
-  currentImageId++;
+
+  // Минимальная задержка для целевого FPS ~15
+  // При 15 FPS период = 1000/15 ≈ 67ms
+  // Учитываем время отправки, поэтому задержка меньше
+  delay(10);
 }
